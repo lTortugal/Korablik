@@ -230,6 +230,10 @@ static bool write_png_file(const std::wstring& path, const std::vector<unsigned 
 
 // ---------- общая точка выхода ----------
 bool export_shot(Shot& s, int mode) {
+    // GDI при рисовании кисти обнуляет альфа-байт в DIB; без этого PNG с штрихами
+    // имеет alpha=0 и просмотрщики (Telegram и др.) показывают штрихи белыми
+    for (size_t i = 0, n = (size_t)s.w * s.h; i < n; i++) s.px[i].rgbReserved = 255;
+
     bool needFile = (mode == EXP_CLIP_FILE || mode == EXP_FILE_ONLY);
     bool needClip = (mode == EXP_CLIP_FILE || mode == EXP_CLIP_ONLY);
 
