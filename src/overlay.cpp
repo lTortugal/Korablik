@@ -2,6 +2,7 @@
 // компактная панель из трёх действий, горячие клавиши 1/2/3/Enter/Esc
 #include "app.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 static const wchar_t* CLS_OVERLAY = L"WinShotOverlayCls";
@@ -42,8 +43,15 @@ struct Overlay {
 
     // рисование поверх выделения (как в Lightshot)
     bool penMode = false;
-    struct Stroke { std::vector<POINT> pts; };
+    COLORREF penColor = RGB(0, 0, 140);
+    struct Stroke { std::vector<POINT> pts; COLORREF color = RGB(0, 0, 140); };
     std::vector<Stroke> strokes;
+    // круговая палитра: колесо (угол=тон, радиус=насыщенность) + полоса яркости + превью
+    double hue = 240, sat = 1.0, val = 0.55;
+    HDC wheelDC = nullptr, barDC = nullptr;
+    HBITMAP wheelBmp = nullptr, barBmp = nullptr;
+    RECT wheelRect = {}, barRect = {}, previewRect = {};
+    int pick = 0; // 0 нет, 1 колесо, 2 полоса
 
     // панель
     RECT tbBtns[4] = {};
@@ -58,6 +66,139 @@ Overlay* ov = nullptr;
 bool g_overlayOpen = false;
 
 int sc(Overlay* o, int logical) { return MulDiv(logical, (int)o->dpi, 96); }
+
+// ---------- круговая палитра ----------
+static const int PAL_M = 256; // размер мастера колеса/полосы в пикселях
+
+static COLORREF hsv_rgb(double h, double s, double v) {
+    if (h < 0) h += 360.0;
+    double c = v * s;
+    double hh = h / 60.0;
+    double x = c * (1.0 - fabs(fmod(hh, 2.0) - 1.0));
+    double m = v - c;
+    double r = 0, g = 0, b = 0;
+    int seg = (int)floor(hh) % 6;
+    switch (seg) {
+        case 0: r = c; g = x; break;
+        case 1: r = x; g = c; break;
+        case 2: g = c; b = x; break;
+        case 3: g = x; b = c; break;
+        case 4: r = x; b = c; break;
+        default: r = c; b = x; break;
+    }
+    return RGB((int)((r + m) * 255 + 0.5), (int)((g + m) * 255 + 0.5), (int)((b + m) * 255 + 0.5));
+}
+
+// колесо зависит только от яркости; полоса — от тона/насыщенности
+static void palette_build_wheel(Overlay* o) {
+    if (o->wheelBmp) {
+        if (o->wheelDC) SelectObject(o->wheelDC, nullptr);
+        DeleteObject(o->wheelBmp);
+        o->wheelBmp = nullptr;
+    }
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = PAL_M;
+    bi.bmiHeader.biHeight = -PAL_M;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    o->wheelBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!o->wheelBmp || !bits) return;
+    if (!o->wheelDC) o->wheelDC = CreateCompatibleDC(nullptr);
+    SelectObject(o->wheelDC, o->wheelBmp);
+    RGBQUAD* px = (RGBQUAD*)bits;
+    double c = (PAL_M - 1) / 2.0;
+    for (int y = 0; y < PAL_M; y++) {
+        for (int i = 0; i < PAL_M; i++) {
+            double dx = (i - c) / c, dy = (y - c) / c;
+            double r2 = dx * dx + dy * dy;
+            RGBQUAD& q = px[(size_t)y * PAL_M + i];
+            if (r2 <= 1.0) {
+                double ang = atan2(-dy, dx) * 180.0 / 3.14159265358979323846;
+                COLORREF col = hsv_rgb(ang, sqrt(r2), o->val);
+                q.rgbRed = GetRValue(col);
+                q.rgbGreen = GetGValue(col);
+                q.rgbBlue = GetBValue(col);
+                q.rgbReserved = 255;
+            } else {
+                q.rgbRed = q.rgbGreen = q.rgbBlue = q.rgbReserved = 0;
+            }
+        }
+    }
+}
+
+static void palette_build_bar(Overlay* o) {
+    if (o->barBmp) {
+        if (o->barDC) SelectObject(o->barDC, nullptr);
+        DeleteObject(o->barBmp);
+        o->barBmp = nullptr;
+    }
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 16;
+    bi.bmiHeader.biHeight = -PAL_M;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    o->barBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!o->barBmp || !bits) return;
+    if (!o->barDC) o->barDC = CreateCompatibleDC(nullptr);
+    SelectObject(o->barDC, o->barBmp);
+    RGBQUAD* px = (RGBQUAD*)bits;
+    for (int y = 0; y < PAL_M; y++) {
+        COLORREF col = hsv_rgb(o->hue, o->sat, 1.0 - y / (double)(PAL_M - 1));
+        for (int x = 0; x < 16; x++) {
+            RGBQUAD& q = px[(size_t)y * 16 + x];
+            q.rgbRed = GetRValue(col);
+            q.rgbGreen = GetGValue(col);
+            q.rgbBlue = GetBValue(col);
+            q.rgbReserved = 255;
+        }
+    }
+}
+
+static void palette_pick(Overlay* o, POINT p) {
+    if (o->pick == 1) {
+        double c = (o->wheelRect.right - o->wheelRect.left) / 2.0;
+        double dx = (p.x - (o->wheelRect.left + c)) / c;
+        double dy = (p.y - (o->wheelRect.top + c)) / c;
+        double r2 = dx * dx + dy * dy;
+        double ns = r2 > 1.0 ? 1.0 : sqrt(r2);
+        double nh = atan2(-dy, dx) * 180.0 / 3.14159265358979323846;
+        if (nh != o->hue || ns != o->sat) {
+            o->hue = nh < 0 ? nh + 360 : nh;
+            o->sat = ns;
+            palette_build_bar(o);
+            o->penColor = hsv_rgb(o->hue, o->sat, o->val);
+            if (o->toolbar) InvalidateRect(o->toolbar, nullptr, FALSE);
+        }
+    } else if (o->pick == 2) {
+        int h = o->barRect.bottom - o->barRect.top;
+        double nv = 1.0 - (p.y - o->barRect.top) / (double)h;
+        if (nv < 0) nv = 0;
+        if (nv > 1) nv = 1;
+        if (nv != o->val) {
+            o->val = nv;
+            palette_build_wheel(o);
+            o->penColor = hsv_rgb(o->hue, o->sat, o->val);
+            if (o->toolbar) InvalidateRect(o->toolbar, nullptr, FALSE);
+        }
+    }
+}
+
+static void palette_free(Overlay* o) {
+    if (o->wheelDC) SelectObject(o->wheelDC, nullptr);
+    if (o->barDC) SelectObject(o->barDC, nullptr);
+    if (o->wheelBmp) DeleteObject(o->wheelBmp);
+    if (o->barBmp) DeleteObject(o->barBmp);
+    if (o->wheelDC) DeleteDC(o->wheelDC);
+    if (o->barDC) DeleteDC(o->barDC);
+    o->wheelBmp = o->barBmp = nullptr;
+    o->wheelDC = o->barDC = nullptr;
+}
 
 RECT norm_rect(const RECT& r) {
     RECT n;
@@ -166,16 +307,15 @@ void show_toolbar(Overlay* o) {
 
 // рисуем штрихи кисти: dx/dy — смещение (0 для оверлея, -sel для кроя), width в физ. px
 void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, int dy, int width) {
-    if (strokes.empty()) return;
-    LOGBRUSH lb = {};
-    lb.lbStyle = BS_SOLID;
-    lb.lbColor = RGB(230, 40, 40);
-    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND, width, &lb, 0, nullptr);
-    if (!pen) return;
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
     for (auto& st : strokes) {
         if (st.pts.empty()) continue;
+        LOGBRUSH lb = {};
+        lb.lbStyle = BS_SOLID;
+        lb.lbColor = st.color;
+        HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND, width, &lb, 0, nullptr);
+        if (!pen) continue;
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
         if (st.pts.size() == 1) {
             POINT c = st.pts[0];
             int r = width / 2 + 1;
@@ -185,10 +325,10 @@ void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, i
             for (auto& p : pts) { p.x += dx; p.y += dy; }
             Polyline(dc, pts.data(), (int)pts.size());
         }
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBr);
+        DeleteObject(pen);
     }
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBr);
-    DeleteObject(pen);
 }
 
 void paint_overlay(HWND hwnd) {
@@ -331,9 +471,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!o) return 0;
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             o->lastPos = p;
-            if (o->penMode) { // режим кисти: рисуем штрих
+            if (o->penMode) { // режим кисти: рисуем штрих текущим цветом
                 Overlay::Stroke st;
                 st.pts.push_back(p);
+                st.color = o->penColor;
                 o->strokes.push_back(std::move(st));
                 o->dragMode = 5;
                 SetCapture(hwnd);
@@ -480,7 +621,7 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < 4; i++) {
                 RECT b = o->tbBtns[i];
                 COLORREF col = RGB(48, 48, 48);
-                if (i == 0 && o->penMode) col = RGB(0, 140, 90);
+                if (i == 0 && o->penMode) col = o->penColor;
                 else if (i == o->hoverBtn) col = RGB(70, 70, 70);
                 HBRUSH bb = CreateSolidBrush(col);
                 FillRect(dc, &b, bb);
@@ -490,17 +631,80 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             SelectObject(dc, oldFont);
 
-            // строка-подсказка
+            // круговая палитра: колесо, полоса яркости, превью выбранного цвета
+            if (o->wheelDC && o->barDC) {
+                int prevMode = SetStretchBltMode(dc, HALFTONE);
+                StretchBlt(dc, o->wheelRect.left, o->wheelRect.top,
+                           o->wheelRect.right - o->wheelRect.left, o->wheelRect.bottom - o->wheelRect.top,
+                           o->wheelDC, 0, 0, PAL_M, PAL_M, SRCCOPY);
+                StretchBlt(dc, o->barRect.left, o->barRect.top,
+                           o->barRect.right - o->barRect.left, o->barRect.bottom - o->barRect.top,
+                           o->barDC, 0, 0, 16, PAL_M, SRCCOPY);
+                SetStretchBltMode(dc, prevMode);
+                // маркеры: точка на колесе и полосе
+                double wc = (o->wheelRect.right - o->wheelRect.left) / 2.0;
+                double ang = o->hue * 3.14159265358979323846 / 180.0;
+                int mx = (int)(o->wheelRect.left + wc + cos(ang) * o->sat * wc);
+                int my = (int)(o->wheelRect.top + wc - sin(ang) * o->sat * wc);
+                HPEN dotPen = CreatePen(PS_SOLID, sc(o, 2), RGB(255, 255, 255));
+                HGDIOBJ op = SelectObject(dc, dotPen);
+                HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Ellipse(dc, mx - sc(o, 4), my - sc(o, 4), mx + sc(o, 4), my + sc(o, 4));
+                int by = o->barRect.top + (int)((1.0 - o->val) * (o->barRect.bottom - o->barRect.top));
+                Rectangle(dc, o->barRect.left - sc(o, 2), by - sc(o, 3), o->barRect.right + sc(o, 2), by + sc(o, 3));
+                SelectObject(dc, op);
+                SelectObject(dc, ob);
+                DeleteObject(dotPen);
+            }
+            HBRUSH pb = CreateSolidBrush(o->penColor);
+            FillRect(dc, &o->previewRect, pb);
+            DeleteObject(pb);
+            HPEN pbrd = CreatePen(PS_SOLID, sc(o, 1), RGB(120, 120, 120));
+            HGDIOBJ opb = SelectObject(dc, pbrd);
+            HGDIOBJ obb = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, o->previewRect.left, o->previewRect.top, o->previewRect.right, o->previewRect.bottom);
+            SelectObject(dc, opb);
+            SelectObject(dc, obb);
+            DeleteObject(pbrd);
+
+            // строка-подсказка под палитрой
             oldFont = SelectObject(dc, o->fontHint);
-            RECT hint = {sc(o, 8), o->tbBtns[0].bottom + sc(o, 4), cr.right - sc(o, 8), o->tbH};
+            RECT hint = {sc(o, 8), o->wheelRect.bottom + sc(o, 3), cr.right - sc(o, 8), o->tbH};
             SetTextColor(dc, RGB(160, 160, 160));
             DrawTextW(dc, LS(S_OV_ESC), -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(dc, oldFont);
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_LBUTTONDOWN: {
+            if (!o) return 0;
+            POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            // колесо: круглая зона; полоса: прямоугольник
+            double wc = (o->wheelRect.right - o->wheelRect.left) / 2.0;
+            double dx = p.x - (o->wheelRect.left + wc), dy = p.y - (o->wheelRect.top + wc);
+            if (wc > 0 && dx * dx + dy * dy <= wc * wc) {
+                o->pick = 1;
+                if (!o->penMode) { o->penMode = true; if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE); }
+                SetCapture(hwnd);
+                palette_pick(o, p);
+                return 0;
+            }
+            if (p.x >= o->barRect.left - sc(o, 3) && p.x <= o->barRect.right + sc(o, 3) &&
+                p.y >= o->barRect.top && p.y <= o->barRect.bottom) {
+                o->pick = 2;
+                if (!o->penMode) { o->penMode = true; if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE); }
+                SetCapture(hwnd);
+                palette_pick(o, p);
+                return 0;
+            }
+            return 0;
+        }
         case WM_MOUSEMOVE: {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (o && o->pick) {
+                palette_pick(o, p);
+                return 0;
+            }
             int i = toolbar_button_at(o, p);
             if (i != o->hoverBtn) {
                 o->hoverBtn = i;
@@ -524,6 +728,12 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONUP: {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (o->pick) { // завершение выбора цвета
+                palette_pick(o, p);
+                o->pick = 0;
+                ReleaseCapture();
+                return 0;
+            }
             int i = toolbar_button_at(o, p);
             if (i == 0) { // переключить режим кисти
                 o->penMode = !o->penMode;
@@ -532,9 +742,9 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SetCursor(LoadCursor(nullptr, o->penMode ? IDC_CROSS : IDC_ARROW));
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
-            } else if (i >= 1) {
-                finish_action(i);
+                return 0;
             }
+            if (i >= 1) { finish_action(i); return 0; }
             return 0;
         }
     }
@@ -653,7 +863,20 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
                 ov->tbBtns[i + 1] = {x, padY, x + bw, padY + bh};
             }
             ov->tbW = padX * 2 + penW + bw * 3 + sep * 3;
-            ov->tbH = padY * 2 + bh + sc(ov, 26);
+            // круговая палитра: колесо + полоса яркости + превью
+            int palTop = padY + bh + sc(ov, 8);
+            int wheelSz = sc(ov, 150);
+            int barW = sc(ov, 22);
+            ov->wheelRect = {padX, palTop, padX + wheelSz, palTop + wheelSz};
+            ov->barRect = {ov->wheelRect.right + sc(ov, 12), palTop,
+                            ov->wheelRect.right + sc(ov, 12) + barW, palTop + wheelSz};
+            ov->previewRect = {ov->barRect.right + sc(ov, 12), palTop,
+                                ov->barRect.right + sc(ov, 12) + barW, palTop + barW};
+            int palW = ov->previewRect.right + padX;
+            if (palW > ov->tbW) ov->tbW = palW;
+            ov->tbH = palTop + wheelSz + sc(ov, 24) + padY;
+            palette_build_wheel(ov);
+            palette_build_bar(ov);
         }
 
         ov->hwnd = CreateWindowExW(WS_EX_TOPMOST, CLS_OVERLAY, L"", WS_POPUP,
@@ -685,6 +908,7 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
 
     if (ov->toolbar) DestroyWindow(ov->toolbar);
     if (ov->hwnd) DestroyWindow(ov->hwnd);
+    palette_free(ov);
     free_surfaces(ov);
     ov = nullptr;
     g_overlayOpen = false;
