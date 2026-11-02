@@ -19,6 +19,7 @@ struct Overlay {
     bool done = false;
 
     int sw = 0, sh = 0; // физический размер монитора под курсором
+    int ox = 0, oy = 0; // начало монитора в экранных координатах
     UINT dpi = 96;
 
     // поверхности: shotDC — яркий оригинал, dimDC — затемнённый фон, memDC — двойная буферизация
@@ -33,14 +34,19 @@ struct Overlay {
     RECT sel = {};   // нормализованный, в координатах оверлея
     POINT anchor = {};
 
-    int dragMode = 0; // 0 нет, 1 новое выделение, 2 перемещение, 3..10 маркер (3+индекс)
+    int dragMode = 0; // 0 нет, 1 новое выделение, 2 перемещение, 3..10 маркер (3+индекс), 5 кисть
     RECT selStart = {};
     POINT lastPos = {};
     bool captured = false;
     int hoverHandle = -99;
 
+    // рисование поверх выделения (как в Lightshot)
+    bool penMode = false;
+    struct Stroke { std::vector<POINT> pts; };
+    std::vector<Stroke> strokes;
+
     // панель
-    RECT tbBtns[3] = {};
+    RECT tbBtns[4] = {};
     int tbW = 0, tbH = 0;
     int hoverBtn = -1;
     bool tracking = false;
@@ -153,7 +159,36 @@ void show_toolbar(Overlay* o) {
     if (y < sc(o, 4)) y = o->sh - o->tbH - sc(o, 4);
     if (x < sc(o, 4)) x = sc(o, 4);
     if (x + o->tbW > o->sw) x = o->sw - o->tbW - sc(o, 4);
-    SetWindowPos(o->toolbar, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // панель — отдельное top-level окно, координаты экраные: прибавляем начало монитора
+    SetWindowPos(o->toolbar, HWND_TOPMOST, o->ox + x, o->oy + y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// рисуем штрихи кисти: dx/dy — смещение (0 для оверлея, -sel для кроя), width в физ. px
+void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, int dy, int width) {
+    if (strokes.empty()) return;
+    LOGBRUSH lb = {};
+    lb.lbStyle = BS_SOLID;
+    lb.lbColor = RGB(230, 40, 40);
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND, width, &lb, 0, nullptr);
+    if (!pen) return;
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    for (auto& st : strokes) {
+        if (st.pts.empty()) continue;
+        if (st.pts.size() == 1) {
+            POINT c = st.pts[0];
+            int r = width / 2 + 1;
+            Ellipse(dc, c.x + dx - r, c.y + dy - r, c.x + dx + r, c.y + dy + r);
+        } else {
+            std::vector<POINT> pts = st.pts;
+            for (auto& p : pts) { p.x += dx; p.y += dy; }
+            Polyline(dc, pts.data(), (int)pts.size());
+        }
+    }
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBr);
+    DeleteObject(pen);
 }
 
 void paint_overlay(HWND hwnd) {
@@ -166,6 +201,7 @@ void paint_overlay(HWND hwnd) {
     if (o->hasSel) {
         RECT s = o->sel;
         BitBlt(o->memDC, s.left, s.top, s.right - s.left, s.bottom - s.top, o->shotDC, s.left, s.top, SRCCOPY);
+        draw_strokes(o->memDC, o->strokes, 0, 0, std::max(2, sc(o, 4)));
 
         HGDIOBJ oldFont = SelectObject(o->memDC, o->font);
         SetBkMode(o->memDC, TRANSPARENT);
@@ -229,6 +265,28 @@ void finish_action(int mode) {
                 memcpy(crop + (size_t)y * w,
                        o->shotBits + ((size_t)(s.top + y) * o->sw + s.left),
                        (size_t)w * sizeof(RGBQUAD));
+            if (!o->strokes.empty()) {
+                // впекаем штрихи кисти в крой через временный DIB
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = w;
+                bi.bmiHeader.biHeight = -h;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+                void* cbits = nullptr;
+                HBITMAP cdib = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &cbits, nullptr, 0);
+                if (cdib && cbits) {
+                    memcpy(cbits, crop, (size_t)w * h * 4);
+                    HDC cdc = CreateCompatibleDC(nullptr);
+                    HGDIOBJ co = SelectObject(cdc, cdib);
+                    draw_strokes(cdc, o->strokes, -s.left, -s.top, std::max(2, sc(o, 4)));
+                    memcpy(crop, cbits, (size_t)w * h * 4);
+                    SelectObject(cdc, co);
+                    DeleteDC(cdc);
+                    DeleteObject(cdib);
+                }
+            }
             Shot sub;
             sub.px = crop;
             sub.w = w;
@@ -273,6 +331,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!o) return 0;
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             o->lastPos = p;
+            if (o->penMode) { // режим кисти: рисуем штрих
+                Overlay::Stroke st;
+                st.pts.push_back(p);
+                o->strokes.push_back(std::move(st));
+                o->dragMode = 5;
+                SetCapture(hwnd);
+                o->captured = true;
+                return 0;
+            }
             int hit = o->hasSel ? hit_test(o->sel, o->hs, p) : -1;
             if (hit == -2) o->dragMode = 2;
             else if (hit >= 0) { o->dragMode = 3 + hit; o->selStart = o->sel; }
@@ -284,10 +351,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEMOVE: {
             if (!o) return 0;
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            if (o->captured && o->dragMode) {
+            if (o->captured && o->dragMode == 5) {
+                auto& pts = o->strokes.back().pts;
+                POINT last = pts.back();
+                if (abs(p.x - last.x) > 2 || abs(p.y - last.y) > 2) {
+                    pts.push_back(p);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            } else if (o->captured && o->dragMode) {
                 update_sel_from_drag(o, p);
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (!o->captured) {
+                if (o->penMode) { SetCursor(LoadCursor(nullptr, IDC_CROSS)); o->hoverHandle = -98; return 0; }
                 int hit = o->hasSel ? hit_test(o->sel, o->hs, p) : -1;
                 if (hit != o->hoverHandle) {
                     o->hoverHandle = hit;
@@ -299,6 +374,10 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONUP: {
             if (!o) return 0;
             if (o->captured) { ReleaseCapture(); o->captured = false; }
+            if (o->dragMode == 5) { // завершён штрих кисти
+                o->dragMode = 0;
+                return 0;
+            }
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             update_sel_from_drag(o, p);
             o->dragMode = 0;
@@ -311,13 +390,25 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             close_overlay();
             return 0;
         case WM_LBUTTONDBLCLK:
-            if (o && o->hasSel) finish_action(EXP_CLIP_FILE);
+            if (o && o->hasSel && !o->penMode) finish_action(EXP_CLIP_FILE);
             return 0;
         case WM_KEYDOWN:
             if (!o) return 0;
             switch (wp) {
                 case VK_ESCAPE:
                     close_overlay();
+                    return 0;
+                case 'P':
+                    o->penMode = !o->penMode;
+                    if (o->toolbar) InvalidateRect(o->toolbar, nullptr, FALSE);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case VK_DELETE:
+                case VK_BACK:
+                    if (o->penMode && !o->strokes.empty()) {
+                        o->strokes.pop_back();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
                     return 0;
                 case '1':
                     if (o->hasSel) finish_action(EXP_CLIP_FILE);
@@ -356,9 +447,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// индекс кнопки панели под точкой (координаты клиента тулбара)
+// индекс кнопки панели под точкой (координаты клиента тулбара); 0 — кисть, 1..3 — действия
 int toolbar_button_at(const Overlay* o, POINT p) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
         if (p.x >= o->tbBtns[i].left && p.x < o->tbBtns[i].right &&
             p.y >= o->tbBtns[i].top && p.y < o->tbBtns[i].bottom)
             return i;
@@ -382,12 +473,16 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             SetBkMode(dc, TRANSPARENT);
             HGDIOBJ oldFont = SelectObject(dc, o->font);
-            const wchar_t* labels[3] = {L"1 \u00B7 \u0431\u0443\u0444\u0435\u0440+\u043F\u0430\u043F\u043A\u0430",
+            const wchar_t* labels[4] = {L"✏",
+                                         L"1 \u00B7 \u0431\u0443\u0444\u0435\u0440+\u043F\u0430\u043F\u043A\u0430",
                                          L"2 \u00B7 \u0431\u0443\u0444\u0435\u0440",
                                          L"3 \u00B7 \u043F\u0430\u043F\u043A\u0430"};
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 4; i++) {
                 RECT b = o->tbBtns[i];
-                HBRUSH bb = CreateSolidBrush(i == o->hoverBtn ? RGB(70, 70, 70) : RGB(48, 48, 48));
+                COLORREF col = RGB(48, 48, 48);
+                if (i == 0 && o->penMode) col = RGB(0, 140, 90);
+                else if (i == o->hoverBtn) col = RGB(70, 70, 70);
+                HBRUSH bb = CreateSolidBrush(col);
                 FillRect(dc, &b, bb);
                 DeleteObject(bb);
                 SetTextColor(dc, RGB(240, 240, 240));
@@ -430,7 +525,16 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONUP: {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             int i = toolbar_button_at(o, p);
-            if (i >= 0) finish_action(i + 1);
+            if (i == 0) { // переключить режим кисти
+                o->penMode = !o->penMode;
+                if (o->hwnd) {
+                    InvalidateRect(o->hwnd, nullptr, FALSE);
+                    SetCursor(LoadCursor(nullptr, o->penMode ? IDC_CROSS : IDC_ARROW));
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (i >= 1) {
+                finish_action(i);
+            }
             return 0;
         }
     }
@@ -502,6 +606,8 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
     Overlay tmp;
     ov = &tmp;
     ov->dpi = dpi;
+    ov->ox = monRc.left;
+    ov->oy = monRc.top;
     ov->sw = monRc.right - monRc.left;
     ov->sh = monRc.bottom - monRc.top;
     ov->hs = sc(ov, 10);
@@ -540,11 +646,13 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
             int padX = sc(ov, 14), padY = sc(ov, 10), sep = sc(ov, 2);
             bw += padX * 2;
             int bh = sc(ov, 40);
+            int penW = sc(ov, 48); // кнопка кисти
+            ov->tbBtns[0] = {padX, padY, padX + penW, padY + bh};
             for (int i = 0; i < 3; i++) {
-                int x = padX + i * (bw + sep);
-                ov->tbBtns[i] = {x, padY, x + bw, padY + bh};
+                int x = padX + penW + sep + i * (bw + sep);
+                ov->tbBtns[i + 1] = {x, padY, x + bw, padY + bh};
             }
-            ov->tbW = padX * 2 + bw * 3 + sep * 2;
+            ov->tbW = padX * 2 + penW + bw * 3 + sep * 3;
             ov->tbH = padY * 2 + bh + sc(ov, 26);
         }
 
