@@ -357,7 +357,7 @@ void paint_overlay(HWND hwnd) {
         // маркеры
         HPEN hpen = CreatePen(PS_SOLID, std::max(1, sc(o, 1)), RGB(255, 255, 255));
         HGDIOBJ pen2 = SelectObject(o->memDC, hpen);
-        HBRUSH hbr = CreateSolidBrush(RGB(0, 170, 120));
+        HBRUSH hbr = CreateSolidBrush(RGB(0, 0, 140));
         HGDIOBJ oldBr2 = SelectObject(o->memDC, hbr);
         int half = std::max(3, sc(o, 5));
         for (int i = 0; i < 8; i++) {
