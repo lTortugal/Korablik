@@ -288,6 +288,7 @@ void update_sel_from_drag(Overlay* o, POINT p) {
 void hide_toolbar(Overlay* o) {
     if (o->toolbar) ShowWindow(o->toolbar, SW_HIDE);
     o->hoverBtn = -1;
+    if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE); // под панелью остаётся оверлей
 }
 
 void show_toolbar(Overlay* o) {
@@ -370,23 +371,25 @@ void paint_overlay(HWND hwnd) {
         DeleteObject(hpen);
         SelectObject(o->memDC, oldBrm);
 
-        // плашка «Ш × В»
-        wchar_t txt[48];
-        swprintf(txt, 48, L"%d \u00D7 %d", s.right - s.left, s.bottom - s.top);
-        SIZE ts = {};
-        GetTextExtentPoint32W(o->memDC, txt, (int)wcslen(txt), &ts);
-        int px = sc(o, 6), py = sc(o, 2);
-        int bx = s.left, by = s.top - (ts.cy + py * 2) - sc(o, 4);
-        if (by < 0) by = s.top + sc(o, 4);
-        if (bx + ts.cx + px * 2 > o->sw) bx = o->sw - (ts.cx + px * 2) - sc(o, 2);
-        HBRUSH bg = CreateSolidBrush(RGB(25, 25, 25));
-        HGDIOBJ oldB = SelectObject(o->memDC, bg);
-        SelectObject(o->memDC, GetStockObject(NULL_PEN));
-        Rectangle(o->memDC, bx, by, bx + ts.cx + px * 2, by + ts.cy + py * 2);
-        SetTextColor(o->memDC, RGB(255, 255, 255));
-        TextOutW(o->memDC, bx + px, by + py, txt, (int)wcslen(txt));
-        SelectObject(o->memDC, oldB);
-        DeleteObject(bg);
+        // плашка «Ш × В» (при активном штрихе не мешаем рисовать — прячем)
+        if (o->dragMode != 5) {
+            wchar_t txt[48];
+            swprintf(txt, 48, L"%d \u00D7 %d", s.right - s.left, s.bottom - s.top);
+            SIZE ts = {};
+            GetTextExtentPoint32W(o->memDC, txt, (int)wcslen(txt), &ts);
+            int px = sc(o, 6), py = sc(o, 2);
+            int bx = s.left, by = s.top - (ts.cy + py * 2) - sc(o, 4);
+            if (by < 0) by = s.top + sc(o, 4);
+            if (bx + ts.cx + px * 2 > o->sw) bx = o->sw - (ts.cx + px * 2) - sc(o, 2);
+            HBRUSH bg = CreateSolidBrush(RGB(25, 25, 25));
+            HGDIOBJ oldB = SelectObject(o->memDC, bg);
+            SelectObject(o->memDC, GetStockObject(NULL_PEN));
+            Rectangle(o->memDC, bx, by, bx + ts.cx + px * 2, by + ts.cy + py * 2);
+            SetTextColor(o->memDC, RGB(255, 255, 255));
+            TextOutW(o->memDC, bx + px, by + py, txt, (int)wcslen(txt));
+            SelectObject(o->memDC, oldB);
+            DeleteObject(bg);
+        }
         SelectObject(o->memDC, oldFont);
     }
     BitBlt(dst, 0, 0, o->sw, o->sh, o->memDC, 0, 0, SRCCOPY);
@@ -472,6 +475,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             o->lastPos = p;
             if (o->penMode) { // режим кисти: рисуем штрих текущим цветом
+                hide_toolbar(o); // панель перекрывает место под рисунком — прячем на время штриха
                 Overlay::Stroke st;
                 st.pts.push_back(p);
                 st.color = o->penColor;
@@ -503,7 +507,14 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 update_sel_from_drag(o, p);
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (!o->captured) {
-                if (o->penMode) { SetCursor(LoadCursor(nullptr, IDC_CROSS)); o->hoverHandle = -98; return 0; }
+                if (o->penMode) {
+                    SetCursor(LoadCursor(nullptr, IDC_CROSS));
+                    o->hoverHandle = -98;
+                    // панель прячем на время штриха; если WM_LBUTTONUP её не вернул
+                    // (клик по панели не активирует оверлей) — возвращаем при первом движении
+                    if (o->toolbar && !IsWindowVisible(o->toolbar)) show_toolbar(o);
+                    return 0;
+                }
                 int hit = o->hasSel ? hit_test(o->sel, o->hs, p) : -1;
                 if (hit != o->hoverHandle) {
                     o->hoverHandle = hit;
@@ -523,7 +534,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             update_sel_from_drag(o, p);
             o->dragMode = 0;
             InvalidateRect(hwnd, nullptr, FALSE);
-            if (o->hasSel) show_toolbar(o);
+            if (o->hasSel && o->dragMode != 5) show_toolbar(o);
             else hide_toolbar(o);
             return 0;
         }
