@@ -14,6 +14,10 @@ extern bool g_quitRequested;
 
 namespace {
 
+// образцы готовых цветов в колонку справа от палитры
+const COLORREF kPresets[6] = {RGB(220, 40, 40), RGB(240, 170, 0), RGB(40, 170, 60),
+                              RGB(0, 160, 240), RGB(0, 0, 0), RGB(255, 255, 255)};
+
 struct Overlay {
     HWND hwnd = nullptr;
     HWND toolbar = nullptr;
@@ -52,6 +56,9 @@ struct Overlay {
     HBITMAP wheelBmp = nullptr, barBmp = nullptr;
     RECT wheelRect = {}, barRect = {}, previewRect = {};
     int pick = 0; // 0 нет, 1 колесо, 2 полоса
+    // готовые цвета под превью: клик ставит цвет и переставляет колесо/полосу
+    RECT presetRects[6] = {};
+    int presetCount = 0;
 
     // панель
     RECT tbBtns[5] = {}; // 0 — кисть, 1 — отмена штриха, 2..4 — действия 1/2/3
@@ -87,6 +94,19 @@ static COLORREF hsv_rgb(double h, double s, double v) {
         default: r = c; b = x; break;
     }
     return RGB((int)((r + m) * 255 + 0.5), (int)((g + m) * 255 + 0.5), (int)((b + m) * 255 + 0.5));
+}
+
+// обратно из цвета в HSV — чтобы готовый образец двигал маркеры колеса и полосы
+static void rgb_hsv(COLORREF c, double& h, double& s, double& v) {
+    double r = GetRValue(c) / 255.0, g = GetGValue(c) / 255.0, b = GetBValue(c) / 255.0;
+    double mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b)), d = mx - mn;
+    v = mx;
+    s = mx == 0 ? 0 : d / mx;
+    if (d == 0) h = 0;
+    else if (mx == r) h = 60.0 * fmod((g - b) / d + 6.0, 6.0);
+    else if (mx == g) h = 60.0 * ((b - r) / d + 2.0);
+    else h = 60.0 * ((r - g) / d + 4.0);
+    if (h < 0) h += 360.0;
 }
 
 // колесо зависит только от яркости; полоса — от тона/насыщенности
@@ -683,6 +703,12 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SelectObject(dc, obb);
             DeleteObject(pbrd);
 
+            for (int i = 0; i < o->presetCount; i++) {
+                HBRUSH sb = CreateSolidBrush(kPresets[i]);
+                FillRect(dc, &o->presetRects[i], sb);
+                DeleteObject(sb);
+            }
+
             // строка-подсказка под палитрой
             oldFont = SelectObject(dc, o->fontHint);
             RECT hint = {sc(o, 8), o->wheelRect.bottom + sc(o, 3), cr.right - sc(o, 8), o->tbH};
@@ -695,6 +721,18 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             if (!o) return 0;
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            for (int i = 0; i < o->presetCount; i++) { // готовые цвета: ставят цвет и включают кисть
+                const RECT& pr = o->presetRects[i];
+                if (p.x >= pr.left && p.x < pr.right && p.y >= pr.top && p.y < pr.bottom) {
+                    o->penColor = kPresets[i];
+                    rgb_hsv(kPresets[i], o->hue, o->sat, o->val);
+                    palette_build_wheel(o);
+                    palette_build_bar(o);
+                    if (!o->penMode) { o->penMode = true; if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE); }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
             // колесо: круглая зона; полоса: прямоугольник
             double wc = (o->wheelRect.right - o->wheelRect.left) / 2.0;
             double dx = p.x - (o->wheelRect.left + wc), dy = p.y - (o->wheelRect.top + wc);
@@ -872,7 +910,8 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
             int gap = sc(ov, 12);
 
             int actMin = std::max(sc(ov, 64), (int)ts.cx + padX * 2);
-            int palMin = sc(ov, 150) + gap * 2 + barW * 2; // колесо в минимуме + полоса + превью
+            int swSz = sc(ov, 20); // превью и готовые цвета — квадраты одного размера
+            int palMin = sc(ov, 150) + gap * 2 + barW + swSz; // колесо в минимуме + полоса + квадрат
             int innerW = std::max(smallW * 2 + sep * 2 + actMin, palMin);
             if ((innerW - sep) % 2) innerW++; // чтобы два нижних действия были ровно равными
             ov->tbW = innerW + padX * 2;
@@ -891,7 +930,15 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
             if (wheelSz < sc(ov, 120)) wheelSz = sc(ov, 120);
             ov->wheelRect = {padX, palTop, padX + wheelSz, palTop + wheelSz};
             ov->barRect = {ov->wheelRect.right + gap, palTop, ov->wheelRect.right + gap + barW, palTop + wheelSz};
-            ov->previewRect = {ov->barRect.right + gap, palTop, ov->barRect.right + gap + barW, palTop + barW};
+            ov->previewRect = {ov->barRect.right + gap, palTop, ov->barRect.right + gap + swSz, palTop + swSz};
+            // готовые цвета — в ту же колонку под превью, сколько влезает по высоте колеса
+            int colTop = ov->previewRect.bottom + sc(ov, 5);
+            int colBottom = palTop + wheelSz;
+            ov->presetCount = 0;
+            for (int y = colTop; y + swSz <= colBottom && ov->presetCount < 6; y += swSz + sc(ov, 5)) {
+                ov->presetRects[ov->presetCount] = {ov->previewRect.left, y, ov->previewRect.left + swSz, y + swSz};
+                ov->presetCount++;
+            }
             ov->tbH = palTop + wheelSz + sc(ov, 24) + padY;
             palette_build_wheel(ov);
             palette_build_bar(ov);
