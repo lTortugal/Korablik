@@ -16,7 +16,10 @@ namespace {
 
 // образцы готовых цветов в колонку справа от палитры
 const COLORREF kPresets[6] = {RGB(220, 40, 40), RGB(240, 170, 0), RGB(40, 170, 60),
-                              RGB(0, 160, 240), RGB(0, 0, 0), RGB(255, 255, 255)};
+                              RGB(0, 0, 140), RGB(0, 0, 0), RGB(255, 255, 255)};
+
+// толщина кисти: ползунок слева (тонко) — справа (толсто), логические пиксели
+const int kPenMinW = 1, kPenMaxW = 16;
 
 struct Overlay {
     HWND hwnd = nullptr;
@@ -48,7 +51,7 @@ struct Overlay {
     // рисование поверх выделения (как в Lightshot)
     bool penMode = false;
     COLORREF penColor = RGB(0, 0, 140);
-    struct Stroke { std::vector<POINT> pts; COLORREF color = RGB(0, 0, 140); };
+    struct Stroke { std::vector<POINT> pts; COLORREF color = RGB(0, 0, 140); int width = 4; };
     std::vector<Stroke> strokes;
     // круговая палитра: колесо (угол=тон, радиус=насыщенность) + полоса яркости + превью
     double hue = 240, sat = 1.0, val = 0.55;
@@ -59,6 +62,9 @@ struct Overlay {
     // готовые цвета под превью: клик ставит цвет и переставляет колесо/полосу
     RECT presetRects[6] = {};
     int presetCount = 0;
+    // ползунок толщины кисти под палитрой
+    int penWidth = 4;
+    RECT sliderRect = {};
 
     // панель
     RECT tbBtns[5] = {}; // 0 — кисть, 1 — отмена штриха, 2..4 — действия 1/2/3
@@ -209,6 +215,24 @@ static void palette_pick(Overlay* o, POINT p) {
     }
 }
 
+static void thickness_pick(Overlay* o, POINT p) {
+    int l = o->sliderRect.left + sc(o, 8), r = o->sliderRect.right - sc(o, 8);
+    if (r <= l) return;
+    double t = (p.x - l) / (double)(r - l);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int nw = kPenMinW + (int)(t * (kPenMaxW - kPenMinW) + 0.5);
+    if (nw == o->penWidth) return;
+    o->penWidth = nw;
+    if (!o->penMode) { o->penMode = true; if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE); }
+    if (o->toolbar) InvalidateRect(o->toolbar, nullptr, FALSE);
+}
+
+static void pick_apply(Overlay* o, POINT p) {
+    if (o->pick == 3) thickness_pick(o, p);
+    else palette_pick(o, p);
+}
+
 static void palette_free(Overlay* o) {
     if (o->wheelDC) SelectObject(o->wheelDC, nullptr);
     if (o->barDC) SelectObject(o->barDC, nullptr);
@@ -326,20 +350,20 @@ void show_toolbar(Overlay* o) {
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-// рисуем штрихи кисти: dx/dy — смещение (0 для оверлея, -sel для кроя), width в физ. px
-void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, int dy, int width) {
+// рисуем штрихи кисти: dx/dy — смещение (0 для оверлея, -sel для кроя), толщина у каждого штриха своя
+void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, int dy) {
     for (auto& st : strokes) {
         if (st.pts.empty()) continue;
         LOGBRUSH lb = {};
         lb.lbStyle = BS_SOLID;
         lb.lbColor = st.color;
-        HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND, width, &lb, 0, nullptr);
+        HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_ENDCAP_ROUND | PS_JOIN_ROUND, st.width, &lb, 0, nullptr);
         if (!pen) continue;
         HGDIOBJ oldPen = SelectObject(dc, pen);
         HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
         if (st.pts.size() == 1) {
             POINT c = st.pts[0];
-            int r = width / 2 + 1;
+            int r = st.width / 2 + 1;
             Ellipse(dc, c.x + dx - r, c.y + dy - r, c.x + dx + r, c.y + dy + r);
         } else {
             std::vector<POINT> pts = st.pts;
@@ -369,7 +393,7 @@ void paint_overlay(HWND hwnd) {
     if (o->hasSel) {
         RECT s = o->sel;
         BitBlt(o->memDC, s.left, s.top, s.right - s.left, s.bottom - s.top, o->shotDC, s.left, s.top, SRCCOPY);
-        draw_strokes(o->memDC, o->strokes, 0, 0, std::max(2, sc(o, 4)));
+        draw_strokes(o->memDC, o->strokes, 0, 0);
 
         HGDIOBJ oldFont = SelectObject(o->memDC, o->font);
         SetBkMode(o->memDC, TRANSPARENT);
@@ -450,7 +474,7 @@ void finish_action(int mode) {
                     memcpy(cbits, crop, (size_t)w * h * 4);
                     HDC cdc = CreateCompatibleDC(nullptr);
                     HGDIOBJ co = SelectObject(cdc, cdib);
-                    draw_strokes(cdc, o->strokes, -s.left, -s.top, std::max(2, sc(o, 4)));
+                    draw_strokes(cdc, o->strokes, -s.left, -s.top);
                     memcpy(crop, cbits, (size_t)w * h * 4);
                     SelectObject(cdc, co);
                     DeleteDC(cdc);
@@ -506,6 +530,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Overlay::Stroke st;
                 st.pts.push_back(p);
                 st.color = o->penColor;
+                st.width = std::max(1, sc(o, o->penWidth)); // фиксируем сейчас: иначе ползунок менял бы уже нарисованные штрихи
                 o->strokes.push_back(std::move(st));
                 o->dragMode = 5;
                 SetCapture(hwnd);
@@ -709,9 +734,31 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DeleteObject(sb);
             }
 
+            // ползунок толщины кисти: дорожка и кружок, размер кружка = текущая толщина
+            {
+                int cy = (o->sliderRect.top + o->sliderRect.bottom) / 2;
+                int l = o->sliderRect.left + sc(o, 8), r = o->sliderRect.right - sc(o, 8);
+                HPEN trk = CreatePen(PS_SOLID, std::max(1, sc(o, 2)), RGB(90, 90, 90));
+                HGDIOBJ otrk = SelectObject(dc, trk);
+                MoveToEx(dc, l, cy, nullptr);
+                LineTo(dc, r, cy);
+                SelectObject(dc, otrk);
+                DeleteObject(trk);
+                double t = (o->penWidth - kPenMinW) / double(kPenMaxW - kPenMinW);
+                int kx = l + (int)(t * (r - l));
+                int kr = std::max(sc(o, 4), sc(o, o->penWidth) / 2);
+                HBRUSH kb = CreateSolidBrush(RGB(230, 230, 230));
+                HGDIOBJ okb = SelectObject(dc, kb);
+                HGDIOBJ okp = SelectObject(dc, GetStockObject(NULL_PEN));
+                Ellipse(dc, kx - kr, cy - kr, kx + kr, cy + kr);
+                SelectObject(dc, okb);
+                SelectObject(dc, okp);
+                DeleteObject(kb);
+            }
+
             // строка-подсказка под палитрой
             oldFont = SelectObject(dc, o->fontHint);
-            RECT hint = {sc(o, 8), o->wheelRect.bottom + sc(o, 3), cr.right - sc(o, 8), o->tbH};
+            RECT hint = {sc(o, 8), o->sliderRect.bottom + sc(o, 2), cr.right - sc(o, 8), o->tbH};
             SetTextColor(dc, RGB(160, 160, 160));
             DrawTextW(dc, LS(S_OV_ESC), -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(dc, oldFont);
@@ -732,6 +779,13 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+            }
+            // ползунок толщины: захват, чтобы можно было вести дальше за пределами полосы
+            if (p.y >= o->sliderRect.top - sc(o, 2) && p.y <= o->sliderRect.bottom + sc(o, 2)) {
+                o->pick = 3;
+                SetCapture(hwnd);
+                thickness_pick(o, p);
+                return 0;
             }
             // колесо: круглая зона; полоса: прямоугольник
             double wc = (o->wheelRect.right - o->wheelRect.left) / 2.0;
@@ -755,8 +809,8 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSEMOVE: {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            if (o && o->pick) {
-                palette_pick(o, p);
+            if (o->pick) {
+                pick_apply(o, p);
                 return 0;
             }
             int i = toolbar_button_at(o, p);
@@ -782,8 +836,8 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONUP: {
             POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            if (o->pick) { // завершение выбора цвета
-                palette_pick(o, p);
+            if (o->pick) { // завершение выбора цвета или толщины
+                pick_apply(o, p);
                 o->pick = 0;
                 ReleaseCapture();
                 return 0;
@@ -939,7 +993,9 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
                 ov->presetRects[ov->presetCount] = {ov->previewRect.left, y, ov->previewRect.left + swSz, y + swSz};
                 ov->presetCount++;
             }
-            ov->tbH = palTop + wheelSz + sc(ov, 24) + padY;
+            int slTop = palTop + wheelSz + sc(ov, 6);
+            ov->sliderRect = {padX, slTop, padX + innerW, slTop + sc(ov, 16)};
+            ov->tbH = ov->sliderRect.bottom + sc(ov, 24) + padY;
             palette_build_wheel(ov);
             palette_build_bar(ov);
         }
