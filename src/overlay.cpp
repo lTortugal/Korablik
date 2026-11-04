@@ -54,7 +54,7 @@ struct Overlay {
     int pick = 0; // 0 нет, 1 колесо, 2 полоса
 
     // панель
-    RECT tbBtns[4] = {};
+    RECT tbBtns[5] = {}; // 0 — кисть, 1 — отмена штриха, 2..4 — действия 1/2/3
     int tbW = 0, tbH = 0;
     int hoverBtn = -1;
     bool tracking = false;
@@ -332,6 +332,13 @@ void draw_strokes(HDC dc, const std::vector<Overlay::Stroke>& strokes, int dx, i
     }
 }
 
+void undo_stroke(Overlay* o) {
+    if (o->strokes.empty()) return;
+    o->strokes.pop_back();
+    if (o->hwnd) InvalidateRect(o->hwnd, nullptr, FALSE);
+    if (o->toolbar) InvalidateRect(o->toolbar, nullptr, FALSE); // кнопка гаснет, когда штрихов не осталось
+}
+
 void paint_overlay(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC dst = BeginPaint(hwnd, &ps);
@@ -557,10 +564,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case VK_DELETE:
                 case VK_BACK:
-                    if (o->penMode && !o->strokes.empty()) {
-                        o->strokes.pop_back();
-                        InvalidateRect(hwnd, nullptr, FALSE);
-                    }
+                    if (o->penMode) undo_stroke(o);
                     return 0;
                 case '1':
                     if (o->hasSel) finish_action(EXP_CLIP_FILE);
@@ -599,9 +603,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// индекс кнопки панели под точкой (координаты клиента тулбара); 0 — кисть, 1..3 — действия
+// индекс кнопки панели под точкой (координаты клиента тулбара); 0 — кисть, 1 — отмена штриха, 2..4 — действия
 int toolbar_button_at(const Overlay* o, POINT p) {
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (p.x >= o->tbBtns[i].left && p.x < o->tbBtns[i].right &&
             p.y >= o->tbBtns[i].top && p.y < o->tbBtns[i].bottom)
             return i;
@@ -625,11 +629,11 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             SetBkMode(dc, TRANSPARENT);
             HGDIOBJ oldFont = SelectObject(dc, o->font);
-            const wchar_t* labels[4] = {L"✏",
+            const wchar_t* labels[5] = {L"✏", L"↺",
                                          L"1 \u00B7 \u0431\u0443\u0444\u0435\u0440+\u043F\u0430\u043F\u043A\u0430",
                                          L"2 \u00B7 \u0431\u0443\u0444\u0435\u0440",
                                          L"3 \u00B7 \u043F\u0430\u043F\u043A\u0430"};
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 5; i++) {
                 RECT b = o->tbBtns[i];
                 COLORREF col = RGB(48, 48, 48);
                 if (i == 0 && o->penMode) col = o->penColor;
@@ -637,7 +641,8 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 HBRUSH bb = CreateSolidBrush(col);
                 FillRect(dc, &b, bb);
                 DeleteObject(bb);
-                SetTextColor(dc, RGB(240, 240, 240));
+                // «↺» без штрихов неактивна
+                SetTextColor(dc, (i == 1 && o->strokes.empty()) ? RGB(110, 110, 110) : RGB(240, 240, 240));
                 DrawTextW(dc, labels[i], -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
             SelectObject(dc, oldFont);
@@ -755,7 +760,8 @@ LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (i >= 1) { finish_action(i); return 0; }
+            if (i == 1) { undo_stroke(o); return 0; }
+            if (i >= 2) { finish_action(i - 1); return 0; }
             return 0;
         }
     }
@@ -849,42 +855,43 @@ void overlay_run(Shot&& shot, const RECT& monRc, UINT dpi) {
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
-        // размеры панели по тексту кнопок
+        // размеры панели: три ряда одинаковой ширины — ✏ ↺ действие / действие действие / палитра
         {
             HDC dc = GetDC(nullptr);
             HGDIOBJ oldf = SelectObject(dc, ov->font);
-            const wchar_t* labels[3] = {L"1 \u00B7 \u0431\u0443\u0444\u0435\u0440+\u043F\u0430\u043F\u043A\u0430",
-                                         L"2 \u00B7 \u0431\u0443\u0444\u0435\u0440",
-                                         L"3 \u00B7 \u043F\u0430\u043F\u043A\u0430"};
-            int bw = 0;
-            for (int i = 0; i < 3; i++) {
-                SIZE ts = {};
-                GetTextExtentPoint32W(dc, labels[i], (int)wcslen(labels[i]), &ts);
-                if (ts.cx > bw) bw = ts.cx;
-            }
+            SIZE ts = {};
+            const wchar_t* longest = L"1 \u00B7 \u0431\u0443\u0444\u0435\u0440+\u043F\u0430\u043F\u043A\u0430";
+            GetTextExtentPoint32W(dc, longest, (int)wcslen(longest), &ts);
             SelectObject(dc, oldf);
             ReleaseDC(nullptr, dc);
+
             int padX = sc(ov, 14), padY = sc(ov, 10), sep = sc(ov, 2);
-            bw += padX * 2;
             int bh = sc(ov, 40);
-            int penW = sc(ov, 48); // кнопка кисти
-            ov->tbBtns[0] = {padX, padY, padX + penW, padY + bh};
-            for (int i = 0; i < 3; i++) {
-                int x = padX + penW + sep + i * (bw + sep);
-                ov->tbBtns[i + 1] = {x, padY, x + bw, padY + bh};
-            }
-            ov->tbW = padX * 2 + penW + bw * 3 + sep * 3;
-            // круговая палитра: колесо + полоса яркости + превью
-            int palTop = padY + bh + sc(ov, 8);
-            int wheelSz = sc(ov, 150);
+            int smallW = sc(ov, 48); // узкие кнопки: кисть и отмена штриха
             int barW = sc(ov, 22);
+            int gap = sc(ov, 12);
+
+            int actMin = std::max(sc(ov, 64), (int)ts.cx + padX * 2);
+            int palMin = sc(ov, 150) + gap * 2 + barW * 2; // колесо в минимуме + полоса + превью
+            int innerW = std::max(smallW * 2 + sep * 2 + actMin, palMin);
+            if ((innerW - sep) % 2) innerW++; // чтобы два нижних действия были ровно равными
+            ov->tbW = innerW + padX * 2;
+
+            int row2Y = padY + bh + sep;
+            ov->tbBtns[0] = {padX, padY, padX + smallW, padY + bh};
+            ov->tbBtns[1] = {padX + smallW + sep, padY, padX + smallW * 2 + sep, padY + bh};
+            ov->tbBtns[2] = {padX + smallW * 2 + sep * 2, padY, padX + innerW, padY + bh};
+            int half = (innerW - sep) / 2;
+            ov->tbBtns[3] = {padX, row2Y, padX + half, row2Y + bh};
+            ov->tbBtns[4] = {padX + half + sep, row2Y, padX + half * 2 + sep, row2Y + bh};
+
+            // круговая палитра: колесо дотянуто до правого края, рядом полоса яркости и превью
+            int palTop = row2Y + bh + sc(ov, 8);
+            int wheelSz = std::min(sc(ov, 200), innerW - (gap * 2 + barW * 2));
+            if (wheelSz < sc(ov, 120)) wheelSz = sc(ov, 120);
             ov->wheelRect = {padX, palTop, padX + wheelSz, palTop + wheelSz};
-            ov->barRect = {ov->wheelRect.right + sc(ov, 12), palTop,
-                            ov->wheelRect.right + sc(ov, 12) + barW, palTop + wheelSz};
-            ov->previewRect = {ov->barRect.right + sc(ov, 12), palTop,
-                                ov->barRect.right + sc(ov, 12) + barW, palTop + barW};
-            int palW = ov->previewRect.right + padX;
-            if (palW > ov->tbW) ov->tbW = palW;
+            ov->barRect = {ov->wheelRect.right + gap, palTop, ov->wheelRect.right + gap + barW, palTop + wheelSz};
+            ov->previewRect = {ov->barRect.right + gap, palTop, ov->barRect.right + gap + barW, palTop + barW};
             ov->tbH = palTop + wheelSz + sc(ov, 24) + padY;
             palette_build_wheel(ov);
             palette_build_bar(ov);
